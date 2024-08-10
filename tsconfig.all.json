@@ -26,6 +26,9 @@
             "path": "./packages/wallet-adapter/react/tsconfig.all.json"
         },
         {
+            "path": "./packages/wallet-adapter/svelte/tsconfig.all.json"
+        },
+        {
             "path": "./packages/wallets/ghost/tsconfig.all.json"
         }
     ]

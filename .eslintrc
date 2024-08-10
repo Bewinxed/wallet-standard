@@ -6,7 +6,8 @@
         "plugin:prettier/recommended",
         "plugin:react/recommended",
         "plugin:react-hooks/recommended",
-        "plugin:require-extensions/recommended"
+        "plugin:require-extensions/recommended",
+        "plugin:svelte/recommended"
     ],
     "parser": "@typescript-eslint/parser",
     "plugins": [
@@ -14,11 +15,17 @@
         "prettier",
         "react",
         "react-hooks",
-        "require-extensions"
+        "require-extensions",
+        "svelte"
     ],
     "settings": {
         "react": {
             "version": "detect"
+        },
+        "svelte": {
+            "compilerOptions": {
+                "enableSvelteConfig": true
+            }
         }
     },
     "rules": {
@@ -35,6 +42,13 @@
         {
             "files": [
                 "**/*.test.ts"
+            ],
+            "rules": {
+                "require-extensions/require-extensions": "off"
+            }
+        }, {
+            "files": [
+                "**/*.svelte"
             ],
             "rules": {
                 "require-extensions/require-extensions": "off"
