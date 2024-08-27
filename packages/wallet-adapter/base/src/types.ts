@@ -2,7 +2,7 @@ import {
     isWalletAdapterCompatibleStandardWallet,
     type StandardWalletAdapter,
     type WalletAdapterCompatibleStandardWallet,
-} from '@solana/wallet-adapter-base';
+} from '@bewinxed/wallet-adapter-base';
 
 /**
  * @deprecated Use `StandardWalletAdapter` from `@solana/wallet-adapter-base` instead.

@@ -1,9 +1,10 @@
 import {
     BaseWalletAdapter,
     isVersionedTransaction,
-    type SendTransactionOptions,
+    type SendTransactionConfig,
     type StandardWalletAdapter as StandardWalletAdapterType,
     type SupportedTransactionVersions,
+    TransactionMessageWithLifetime,
     WalletAccountError,
     type WalletAdapterCompatibleStandardWallet,
     WalletConfigError,
@@ -20,7 +21,8 @@ import {
     WalletSignInError,
     WalletSignMessageError,
     WalletSignTransactionError,
-} from '@solana/wallet-adapter-base';
+} from '@bewinxed/wallet-adapter-base';
+
 import {
     SolanaSignAndSendTransaction,
     type SolanaSignAndSendTransactionFeature,
@@ -31,9 +33,35 @@ import {
     SolanaSignTransaction,
     type SolanaSignTransactionFeature,
 } from '@solana/wallet-standard-features';
-import { getChainForEndpoint, getCommitment } from '@solana/wallet-standard-util';
-import type { Connection, TransactionSignature } from '@solana/web3.js';
-import { PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
+import { getChainForEndpoint, getCommitment } from '@bewinxed/wallet-standard-util';
+import type {
+    Base64EncodedWireTransaction,
+    CompilableTransactionMessage,
+    ITransactionMessageWithFeePayer,
+    Rpc,
+    Signature,
+    SolanaRpcApi,
+    TransactionBlockhashLifetime,
+    TransactionDurableNonceLifetime,
+} from '@solana/web3.js';
+import {
+    Address,
+    address as createAddress,
+    Transaction,
+    BaseTransactionMessage,
+    compileTransaction,
+    pipe,
+    signTransaction,
+    getBase64EncodedWireTransaction,
+    partiallySignTransaction,
+    signature,
+    getTransactionDecoder,
+    getBase64Encoder,
+    decodeTransactionMessage,
+    getCompiledTransactionMessageEncoder,
+    getCompiledTransactionMessageDecoder,
+    decompileTransactionMessage,
+} from '@solana/web3.js';
 import type { WalletAccount } from '@wallet-standard/base';
 import {
     StandardConnect,
@@ -50,12 +78,22 @@ export interface StandardWalletAdapterConfig {
     wallet: WalletAdapterCompatibleStandardWallet;
 }
 
+function uint8ArrayTransactionToBase64(transaction: Uint8Array): Base64EncodedWireTransaction {
+    // Step 1: Decode the Uint8Array into a transaction object
+    const transactionDecoder = getTransactionDecoder();
+    const decodedTransaction = transactionDecoder.decode(transaction);
+
+    // Step 2: Get the base64 encoded wire transaction
+    return getBase64EncodedWireTransaction(decodedTransaction);
+}
+
 /** TODO: docs */
 export class StandardWalletAdapter extends BaseWalletAdapter implements StandardWalletAdapterType {
     #account: WalletAccount | null;
-    #publicKey: PublicKey | null;
+    #address: Address | null;
     #connecting: boolean;
     #disconnecting: boolean;
+    #endpoint: string | undefined;
     #off: (() => void) | null;
     #supportedTransactionVersions: SupportedTransactionVersions;
     readonly #wallet: WalletAdapterCompatibleStandardWallet;
@@ -80,8 +118,12 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
         return this.#readyState;
     }
 
-    get publicKey() {
-        return this.#publicKey;
+    get address() {
+        return this.#address;
+    }
+
+    get endpoint() {
+        return this.#endpoint || 'https://api.mainnet-beta.solana.com';
     }
 
     get connecting() {
@@ -105,7 +147,8 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
 
         this.#wallet = wallet;
         this.#account = null;
-        this.#publicKey = null;
+        this.#address = null;
+        this.#endpoint = undefined;
         this.#connecting = false;
         this.#disconnecting = false;
         this.#off = this.#wallet.features[StandardEvents].on('change', this.#changed);
@@ -115,7 +158,8 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
 
     destroy(): void {
         this.#account = null;
-        this.#publicKey = null;
+        this.#address = null;
+        this.#endpoint = undefined;
         this.#connecting = false;
         this.#disconnecting = false;
 
@@ -177,23 +221,23 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
     }
 
     #connected(account: WalletAccount) {
-        let publicKey: PublicKey;
+        let address: Address;
         try {
             // Use account.address instead of account.publicKey since address could be a PDA
-            publicKey = new PublicKey(account.address);
+            address = createAddress(account.address);
         } catch (error: any) {
             throw new WalletPublicKeyError(error?.message, error);
         }
 
         this.#account = account;
-        this.#publicKey = publicKey;
+        this.#address = address;
         this.#reset();
-        this.emit('connect', publicKey);
+        this.emit('connect', address);
     }
 
     #disconnected(): void {
         this.#account = null;
-        this.#publicKey = null;
+        this.#address = null;
         this.#reset();
         this.emit('disconnect');
     }
@@ -253,11 +297,13 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
         }
     };
 
-    async sendTransaction<T extends Transaction | VersionedTransaction>(
+    async sendTransaction<T extends BaseTransactionMessage>(
         transaction: T,
-        connection: Connection,
-        options: SendTransactionOptions = {}
-    ): Promise<TransactionSignature> {
+        rpc: Rpc<SolanaRpcApi>,
+        options: SendTransactionConfig = {
+            encoding: 'base64',
+        }
+    ): Promise<Signature> {
         try {
             const account = this.#account;
             if (!account) throw new WalletNotConnectedError();
@@ -281,25 +327,62 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
                 throw new WalletConfigError();
             }
 
-            const chain = getChainForEndpoint(connection.rpcEndpoint);
-            if (!account.chains.includes(chain)) throw new WalletSendTransactionError();
-
+            const chain = getChainForEndpoint(
+                this.endpoint ?? 'https://api.mainnet-beta.solana.com'
+                //  ?? rpc.endpoint);
+            );
+            // if (!account.chains.includes(chain)) throw new WalletSendTransactionError();
+            async function getOrPassBlockhash<T extends TransactionMessageWithLifetime>(transaction: T) {
+                return 'lifetimeConstraint' in transaction &&
+                    'blockhash' in transaction.lifetimeConstraint &&
+                    'blockhash' in transaction.lifetimeConstraint
+                    ? transaction.lifetimeConstraint
+                    : await rpc
+                          .getLatestBlockhash({
+                              commitment: options.preflightCommitment,
+                              minContextSlot: options.minContextSlot,
+                          })
+                          .send()
+                          .then((res) => res.value);
+            }
             try {
                 const { signers, ...sendOptions } = options;
-
-                let serializedTransaction: Uint8Array;
+                const blockhashOpts = await getOrPassBlockhash(transaction);
+                let serializedTransaction: Base64EncodedWireTransaction;
                 if (isVersionedTransaction(transaction)) {
-                    signers?.length && transaction.sign(signers);
-                    serializedTransaction = transaction.serialize();
-                } else {
-                    transaction = (await this.prepareTransaction(transaction, connection, sendOptions)) as T;
-                    signers?.length && (transaction as Transaction).partialSign(...signers);
-                    serializedTransaction = new Uint8Array(
-                        (transaction as Transaction).serialize({
-                            requireAllSignatures: false,
-                            verifySignatures: false,
-                        })
+                    serializedTransaction = await pipe(
+                        transaction,
+                        async (msg) => this.prepareTransaction(msg, blockhashOpts),
+                        async (msg) => compileTransaction(await msg),
+                        async (msg) =>
+                            signers?.length
+                                ? await signTransaction(
+                                      signers.map((s) => s.keyPair),
+                                      await msg
+                                  )
+                                : await msg,
+                        async (msg) => getBase64EncodedWireTransaction(await msg)
                     );
+                } else {
+                    serializedTransaction = await pipe(
+                        transaction,
+                        async (msg) => this.prepareTransaction(msg, blockhashOpts),
+                        async (msg) => compileTransaction(await msg),
+                        async (msg) =>
+                            signers?.length
+                                ? await partiallySignTransaction(
+                                      signers.map((s) => s.keyPair),
+                                      await msg
+                                  )
+                                : await msg,
+                        async (msg) => getBase64EncodedWireTransaction(await msg)
+                    );
+                    // serializedTransaction = new Uint8Array(
+                    //     (transaction as Transaction).serialize({
+                    //         requireAllSignatures: false,
+                    //         verifySignatures: false,
+                    //     })
+                    // );
                 }
 
                 if (feature === SolanaSignAndSendTransaction) {
@@ -308,39 +391,49 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
                     ].signAndSendTransaction({
                         account,
                         chain,
-                        transaction: serializedTransaction,
+                        transaction: Uint8Array.from(serializedTransaction.split('').map((s) => s.charCodeAt(0))),
                         options: {
                             preflightCommitment: getCommitment(
-                                sendOptions.preflightCommitment || connection.commitment
+                                sendOptions.preflightCommitment
+                                // || connection.commitment
                             ),
                             skipPreflight: sendOptions.skipPreflight,
-                            maxRetries: sendOptions.maxRetries,
-                            minContextSlot: sendOptions.minContextSlot,
+                            maxRetries: sendOptions.maxRetries as number | undefined,
+                            minContextSlot: sendOptions.minContextSlot as number | undefined,
                         },
                     });
 
                     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                    return bs58.encode(output!.signature);
+                    return signature(bs58.encode(output!.signature));
                 } else {
                     const [output] = await (this.#wallet.features as SolanaSignTransactionFeature)[
                         SolanaSignTransaction
                     ].signTransaction({
                         account,
                         chain,
-                        transaction: serializedTransaction,
+                        transaction: Uint8Array.from(serializedTransaction.split('').map((s) => s.charCodeAt(0))),
                         options: {
                             preflightCommitment: getCommitment(
-                                sendOptions.preflightCommitment || connection.commitment
+                                sendOptions.preflightCommitment
+                                //  || rpc.commitment
                             ),
-                            minContextSlot: sendOptions.minContextSlot,
+                            minContextSlot: sendOptions.minContextSlot as number | undefined,
                         },
                     });
 
                     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                    return await connection.sendRawTransaction(output!.signedTransaction, {
-                        ...sendOptions,
-                        preflightCommitment: getCommitment(sendOptions.preflightCommitment || connection.commitment),
-                    });
+                    return await rpc
+                        .sendTransaction(
+                            getBase64EncodedWireTransaction(getTransactionDecoder().decode(output!.signedTransaction)),
+                            {
+                                ...sendOptions,
+                                preflightCommitment: getCommitment(
+                                    sendOptions.preflightCommitment
+                                    // ||  connection.commitment),
+                                ),
+                            }
+                        )
+                        .send();
                 }
             } catch (error: any) {
                 if (error instanceof WalletError) throw error;
@@ -352,36 +445,41 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
         }
     }
 
-    signTransaction: (<T extends Transaction | VersionedTransaction>(transaction: T) => Promise<T>) | undefined;
-    async #signTransaction<T extends Transaction | VersionedTransaction>(transaction: T): Promise<T> {
+    signTransaction: (<T extends CompilableTransactionMessage>(transaction: T) => Promise<T>) | undefined;
+    async #signTransaction<T extends CompilableTransactionMessage>(transaction: T): Promise<T> {
         try {
             const account = this.#account;
             if (!account) throw new WalletNotConnectedError();
-
             if (!(SolanaSignTransaction in this.#wallet.features)) throw new WalletConfigError();
             if (!account.features.includes(SolanaSignTransaction)) throw new WalletAccountError();
 
             try {
                 const signedTransactions = await this.#wallet.features[SolanaSignTransaction].signTransaction({
                     account,
-                    transaction: isVersionedTransaction(transaction)
-                        ? transaction.serialize()
-                        : new Uint8Array(
-                              transaction.serialize({
-                                  requireAllSignatures: false,
-                                  verifySignatures: false,
-                              })
-                          ),
+                    transaction: Uint8Array.from(
+                        getBase64EncodedWireTransaction(compileTransaction(transaction))
+                            .split('')
+                            .map((s) => s.charCodeAt(0))
+                    ),
+                    // ? transaction.serialize()
+                    // : new Uint8Array(
+                    //       transaction.serialize({
+                    //           requireAllSignatures: false,
+                    //           verifySignatures: false,
+                    //       })
+                    //   ),
                 });
 
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
                 const serializedTransaction = signedTransactions[0]!.signedTransaction;
 
-                return (
-                    isVersionedTransaction(transaction)
-                        ? VersionedTransaction.deserialize(serializedTransaction)
-                        : Transaction.from(serializedTransaction)
-                ) as T;
+                const txDecoder = getTransactionDecoder();
+                const decodedTransaction = txDecoder.decode(serializedTransaction);
+                const compiledTransactionMessage = getCompiledTransactionMessageDecoder().decode(
+                    decodedTransaction.messageBytes
+                );
+                const decompiledTransactionMessage = decompileTransactionMessage(compiledTransactionMessage);
+                return decompiledTransactionMessage as T;
             } catch (error: any) {
                 if (error instanceof WalletError) throw error;
                 throw new WalletSignTransactionError(error?.message, error);
@@ -392,8 +490,8 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
         }
     }
 
-    signAllTransactions: (<T extends Transaction | VersionedTransaction>(transaction: T[]) => Promise<T[]>) | undefined;
-    async #signAllTransactions<T extends Transaction | VersionedTransaction>(transactions: T[]): Promise<T[]> {
+    signAllTransactions: (<T extends CompilableTransactionMessage>(transaction: T[]) => Promise<T[]>) | undefined;
+    async #signAllTransactions<T extends CompilableTransactionMessage>(transactions: T[]): Promise<T[]> {
         try {
             const account = this.#account;
             if (!account) throw new WalletNotConnectedError();
@@ -405,14 +503,18 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
                 const signedTransactions = await this.#wallet.features[SolanaSignTransaction].signTransaction(
                     ...transactions.map((transaction) => ({
                         account,
-                        transaction: isVersionedTransaction(transaction)
-                            ? transaction.serialize()
-                            : new Uint8Array(
-                                  transaction.serialize({
-                                      requireAllSignatures: false,
-                                      verifySignatures: false,
-                                  })
-                              ),
+                        transaction: Uint8Array.from(
+                            getBase64EncodedWireTransaction(compileTransaction(transaction))
+                                .split('')
+                                .map((s) => s.charCodeAt(0))
+                        ),
+                        // ? transaction.serialize()
+                        // : new Uint8Array(
+                        //       transaction.serialize({
+                        //           requireAllSignatures: false,
+                        //           verifySignatures: false,
+                        //       })
+                        //   ),
                     }))
                 );
 
@@ -420,11 +522,13 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
                     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
                     const signedTransaction = signedTransactions[index]!.signedTransaction;
 
-                    return (
-                        isVersionedTransaction(transaction)
-                            ? VersionedTransaction.deserialize(signedTransaction)
-                            : Transaction.from(signedTransaction)
-                    ) as T;
+                    const txDecoder = getTransactionDecoder();
+                    const decodedTransaction = txDecoder.decode(signedTransaction);
+                    const compiledTransactionMessage = getCompiledTransactionMessageDecoder().decode(
+                        decodedTransaction.messageBytes
+                    );
+                    const decompiledTransactionMessage = decompileTransactionMessage(compiledTransactionMessage);
+                    return decompiledTransactionMessage as T;
                 });
             } catch (error: any) {
                 throw new WalletSignTransactionError(error?.message, error);

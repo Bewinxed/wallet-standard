@@ -1,8 +1,8 @@
 {
-    "name": "@solana/wallet-standard-wallet-adapter-base",
+    "name": "@bewinxed/wallet-standard-wallet-adapter-base",
     "version": "1.1.2",
-    "author": "Solana Maintainers <maintainers@solana.foundation>",
-    "repository": "https://github.com/solana-labs/wallet-standard",
+    "author": "Bewinxed <bewinxed@gmail.com>",
+    "repository": "https://github.com/bewinxed/wallet-standard",
     "license": "Apache-2.0",
     "publishConfig": {
         "access": "public"
@@ -26,26 +26,26 @@
         "types": "./lib/types/index.d.ts"
     },
     "scripts": {
+        "build": "tsc --build --verbose tsconfig.json && npm run package",
         "clean": "shx mkdir -p lib && shx rm -rf lib",
         "package": "shx mkdir -p lib/cjs && shx echo '{ \"type\": \"commonjs\" }' > lib/cjs/package.json"
     },
     "peerDependencies": {
-        "@solana/web3.js": "^1.58.0",
+        "@solana/web3.js": "^2.0.0-rc.1",
         "bs58": "^4.0.1"
     },
     "dependencies": {
-        "@solana/wallet-adapter-base": "^0.9.23",
-        "@solana/wallet-standard-chains": "workspace:^",
-        "@solana/wallet-standard-features": "workspace:^",
-        "@solana/wallet-standard-util": "workspace:^",
+        "@bewinxed/wallet-adapter-base": "^0.9.27",
+        "@bewinxed/wallet-standard-util": "^1.1.5",
+        "@solana/wallet-standard-features": "latest",
         "@wallet-standard/app": "^1.0.1",
         "@wallet-standard/base": "^1.0.1",
         "@wallet-standard/features": "^1.0.3",
         "@wallet-standard/wallet": "^1.0.1"
     },
     "devDependencies": {
-        "@solana/web3.js": "^1.58.0",
-        "@types/bs58": "^4.0.1",
+        "@solana/web3.js": "^2.0.0-rc.1",
+        "@types/bs58": "^4.0.4",
         "bs58": "^4.0.1",
         "shx": "^0.3.4"
     }

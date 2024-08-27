@@ -1,4 +1,5 @@
-import { type Adapter, isVersionedTransaction, WalletReadyState } from '@solana/wallet-adapter-base';
+import { type Adapter, WalletReadyState } from '@bewinxed/wallet-adapter-base';
+import { getEndpointForChain } from '@bewinxed/wallet-standard-util';
 import { isSolanaChain, type SolanaChain } from '@solana/wallet-standard-chains';
 import {
     SolanaSignAndSendTransaction,
@@ -19,8 +20,19 @@ import {
     type SolanaSignTransactionOutput,
     type SolanaTransactionVersion,
 } from '@solana/wallet-standard-features';
-import { getEndpointForChain } from '@solana/wallet-standard-util';
-import { Connection, Transaction, VersionedTransaction } from '@solana/web3.js';
+import {
+    CompilableTransactionMessage,
+    compileTransaction,
+    createSolanaRpc,
+    decompileTransactionMessage,
+    getBase58Encoder,
+    getBase64EncodedWireTransaction,
+    getCompiledTransactionMessageDecoder,
+    GetLatestBlockhashApi,
+    GetTransactionApi,
+    Rpc,
+    SendTransactionApi,
+} from '@solana/web3.js';
 import { getWallets } from '@wallet-standard/app';
 import type { Wallet, WalletIcon } from '@wallet-standard/base';
 import {
@@ -36,7 +48,7 @@ import {
     type StandardEventsNames,
     type StandardEventsOnMethod,
 } from '@wallet-standard/features';
-import { arraysEqual, bytesEqual, ReadonlyWalletAccount } from '@wallet-standard/wallet';
+import { bytesEqual, ReadonlyWalletAccount } from '@wallet-standard/wallet';
 import bs58 from 'bs58';
 
 /** TODO: docs */
@@ -85,7 +97,7 @@ export class SolanaWalletAdapterWallet implements Wallet {
     readonly #adapter: Adapter;
     readonly #supportedTransactionVersions: readonly SolanaTransactionVersion[];
     readonly #chain: SolanaChain;
-    readonly #endpoint: string | undefined;
+    readonly #endpoint: string;
     #account: SolanaWalletAdapterWalletAccount | undefined;
 
     get version() {
@@ -173,7 +185,7 @@ export class SolanaWalletAdapterWallet implements Wallet {
         return this.#endpoint;
     }
 
-    constructor(adapter: Adapter, chain: SolanaChain, endpoint?: string) {
+    constructor(adapter: Adapter, chain: SolanaChain, endpoint: string = 'https://api.mainnet-beta.solana.com') {
         if (new.target === SolanaWalletAdapterWallet) {
             Object.freeze(this);
         }
@@ -200,21 +212,21 @@ export class SolanaWalletAdapterWallet implements Wallet {
     }
 
     #connected(): void {
-        const publicKey = this.#adapter.publicKey?.toBytes();
-        if (publicKey) {
+        const adapterAddress = this.#adapter.address ? new TextEncoder().encode(this.#adapter.address) : null;
+        if (adapterAddress) {
             // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            const address = this.#adapter.publicKey!.toBase58();
+            const address = getBase58Encoder().encode(this.#adapter.address!).toString();
             const account = this.#account;
             if (
                 !account ||
                 account.address !== address ||
                 account.chains.includes(this.#chain) ||
-                !bytesEqual(account.publicKey, publicKey)
+                !bytesEqual(account.publicKey, adapterAddress)
             ) {
                 this.#account = new SolanaWalletAdapterWalletAccount({
                     adapter: this.#adapter,
                     address,
-                    publicKey,
+                    publicKey: adapterAddress,
                     chains: [this.#chain],
                 });
                 this.#emit('change', { accounts: this.accounts });
@@ -257,13 +269,14 @@ export class SolanaWalletAdapterWallet implements Wallet {
         this.#listeners[event] = this.#listeners[event]?.filter((existingListener) => listener !== existingListener);
     }
 
-    #deserializeTransaction(serializedTransaction: Uint8Array): Transaction | VersionedTransaction {
-        const transaction = VersionedTransaction.deserialize(serializedTransaction);
-        if (!this.#supportedTransactionVersions.includes(transaction.version))
+    #deserializeTransaction(serializedTransaction: Uint8Array): CompilableTransactionMessage {
+        const compiledTransactionMessage = getCompiledTransactionMessageDecoder().decode(serializedTransaction);
+        const decompiledTransactionMessage = decompileTransactionMessage(compiledTransactionMessage);
+        if (!this.#supportedTransactionVersions.includes(decompiledTransactionMessage.version))
             throw new Error('unsupported transaction version');
-        if (transaction.version === 'legacy' && arraysEqual(this.#supportedTransactionVersions, ['legacy']))
-            return Transaction.from(serializedTransaction);
-        return transaction;
+        // if (decompiledTransactionMessage.version === 'legacy' && arraysEqual(this.#supportedTransactionVersions, ['legacy']))
+        return decompiledTransactionMessage;
+        // return transaction;
     }
 
     #signAndSendTransaction: SolanaSignAndSendTransactionMethod = async (...inputs) => {
@@ -274,33 +287,39 @@ export class SolanaWalletAdapterWallet implements Wallet {
             const input = inputs[0]!;
             if (input.account !== this.#account) throw new Error('invalid account');
             if (!isSolanaChain(input.chain)) throw new Error('invalid chain');
+
             const transaction = this.#deserializeTransaction(input.transaction);
             const { commitment, preflightCommitment, skipPreflight, maxRetries, minContextSlot } = input.options || {};
-            const endpoint = getEndpointForChain(input.chain, this.#endpoint);
-            const connection = new Connection(endpoint, commitment || 'confirmed');
+            const endpoint = getEndpointForChain(input.chain);
+
+            const rpc = createSolanaRpc(endpoint) as Rpc<
+                GetLatestBlockhashApi & SendTransactionApi & GetTransactionApi
+            >;
 
             const latestBlockhash = commitment
-                ? await connection.getLatestBlockhash({
-                      commitment: preflightCommitment || commitment,
-                      minContextSlot,
-                  })
+                ? await rpc
+                      .getLatestBlockhash({
+                          commitment: preflightCommitment || commitment,
+                          minContextSlot: minContextSlot ? BigInt(minContextSlot) : undefined,
+                      })
+                      .send()
                 : undefined;
 
-            const signature = await this.#adapter.sendTransaction(transaction, connection, {
+            const signature = await this.#adapter.sendTransaction(transaction, rpc, {
+                encoding: 'base64',
                 preflightCommitment,
                 skipPreflight,
-                maxRetries,
-                minContextSlot,
+                maxRetries: maxRetries ? BigInt(maxRetries) : undefined,
+                minContextSlot: minContextSlot ? BigInt(minContextSlot) : undefined,
             });
 
             if (latestBlockhash) {
-                await connection.confirmTransaction(
-                    {
+                await rpc
+                    .getTransaction(signature, {
                         ...latestBlockhash,
-                        signature,
-                    },
-                    commitment || 'confirmed'
-                );
+                        commitment: commitment || 'confirmed',
+                    })
+                    .send();
             }
 
             outputs.push({ signature: bs58.decode(signature) });
@@ -325,16 +344,21 @@ export class SolanaWalletAdapterWallet implements Wallet {
             if (input.chain && !isSolanaChain(input.chain)) throw new Error('invalid chain');
             const transaction = this.#deserializeTransaction(input.transaction);
 
-            const signedTransaction = await this.#adapter.signTransaction(transaction);
+            const signedTransaction = await this.#adapter.signTransaction(compileTransaction(transaction));
 
-            const serializedTransaction = isVersionedTransaction(signedTransaction)
-                ? signedTransaction.serialize()
-                : new Uint8Array(
-                      signedTransaction.serialize({
-                          requireAllSignatures: false,
-                          verifySignatures: false,
-                      })
-                  );
+            const serializedTransaction = Uint8Array.from(
+                getBase64EncodedWireTransaction(signedTransaction)
+                    .split('')
+                    .map((s) => s.charCodeAt(0))
+            );
+            // isVersionedTransaction(signedTransaction)
+            //     ? signedTransaction.serialize()
+            //     : new Uint8Array(
+            //           signedTransaction.serialize({
+            //               requireAllSignatures: false,
+            //               verifySignatures: false,
+            //           })
+            //       );
 
             outputs.push({ signedTransaction: serializedTransaction });
         } else if (inputs.length > 1) {
@@ -342,20 +366,27 @@ export class SolanaWalletAdapterWallet implements Wallet {
                 if (input.account !== this.#account) throw new Error('invalid account');
                 if (input.chain && !isSolanaChain(input.chain)) throw new Error('invalid chain');
             }
-            const transactions = inputs.map(({ transaction }) => this.#deserializeTransaction(transaction));
+            const transactions = inputs.map(({ transaction }) =>
+                compileTransaction(this.#deserializeTransaction(transaction))
+            );
 
             const signedTransactions = await this.#adapter.signAllTransactions(transactions);
 
             outputs.push(
                 ...signedTransactions.map((signedTransaction) => {
-                    const serializedTransaction = isVersionedTransaction(signedTransaction)
-                        ? signedTransaction.serialize()
-                        : new Uint8Array(
-                              signedTransaction.serialize({
-                                  requireAllSignatures: false,
-                                  verifySignatures: false,
-                              })
-                          );
+                    const serializedTransaction = Uint8Array.from(
+                        getBase64EncodedWireTransaction(signedTransaction)
+                            .split('')
+                            .map((s) => s.charCodeAt(0))
+                    );
+                    // isVersionedTransaction(signedTransaction)
+                    //     ? signedTransaction.serialize()
+                    //     : new Uint8Array(
+                    //           signedTransaction.serialize({
+                    //               requireAllSignatures: false,
+                    //               verifySignatures: false,
+                    //           })
+                    //       );
 
                     return { signedTransaction: serializedTransaction };
                 })
